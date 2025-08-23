@@ -1,11 +1,13 @@
 const { ethers } = require('ethers');
 const logger = require('../utils/logger');
+const TokenTransaction = require('../models/tokenTransactionModel');
 
 class Web3Service {
   constructor() {
     this.provider = null;
     this.wallet = null;
     this.contracts = {};
+    this.eventListeners = new Map();
     this.initialize();
   }
 
@@ -23,6 +25,9 @@ class Web3Service {
       // Initialize contracts
       await this.initializeContracts();
       
+      // Setup event listeners
+      this.setupEventListeners();
+      
       logger.info('Web3Service initialized successfully');
     } catch (error) {
       logger.error('Failed to initialize Web3Service:', error);
@@ -34,45 +39,54 @@ class Web3Service {
     try {
       // WKC Token Contract ABI (simplified)
       const wkcTokenABI = [
+        "function name() view returns (string)",
+        "function symbol() view returns (string)",
+        "function decimals() view returns (uint8)",
+        "function totalSupply() view returns (uint256)",
+        "function totalBurned() view returns (uint256)",
+        "function getCirculatingSupply() view returns (uint256)",
+        "function getBurnRate() view returns (uint256)",
         "function balanceOf(address owner) view returns (uint256)",
         "function transfer(address to, uint256 amount) returns (bool)",
         "function transferFrom(address from, address to, uint256 amount) returns (bool)",
         "function approve(address spender, uint256 amount) returns (bool)",
         "function allowance(address owner, address spender) view returns (uint256)",
-        "function totalSupply() view returns (uint256)",
-        "function decimals() view returns (uint8)",
-        "function symbol() view returns (string)",
-        "function name() view returns (string)",
+        "function burn(uint256 amount, string reason)",
+        "function burnFrom(address account, uint256 amount, string reason)",
         "event Transfer(address indexed from, address indexed to, uint256 value)",
-        "event Approval(address indexed owner, address indexed spender, uint256 value)"
+        "event Approval(address indexed owner, address indexed spender, uint256 value)",
+        "event TokensBurned(uint256 amount, address indexed burner, string reason)"
       ];
 
       // Auction Contract ABI (simplified)
       const auctionContractABI = [
-        "function createAuction(string memory title, uint256 startingBid, uint256 duration, uint256 reservePrice) returns (uint256)",
-        "function placeBid(uint256 auctionId, uint256 bidAmount) payable",
+        "function createAuction(string title, string description, uint256 startingBid, uint256 reservePrice, uint256 buyNowPrice, uint256 duration, bool isReverse) returns (uint256)",
+        "function placeBid(uint256 auctionId, uint256 bidAmount)",
+        "function buyNow(uint256 auctionId)",
         "function endAuction(uint256 auctionId)",
-        "function getAuction(uint256 auctionId) view returns (tuple(address seller, uint256 startingBid, uint256 currentBid, uint256 endTime, bool active))",
-        "function withdrawBid(uint256 auctionId)",
-        "event AuctionCreated(uint256 indexed auctionId, address indexed seller, uint256 startingBid)",
+        "function getAuctionDetails(uint256 auctionId) view returns (address seller, string title, uint256 currentBid, uint256 endTime, address highestBidder, bool isActive, bool isReverse, uint256 totalBids)",
+        "function getUserAuctions(address user) view returns (uint256[])",
+        "function getUserBids(address user) view returns (uint256[])",
+        "event AuctionCreated(uint256 indexed auctionId, address indexed seller, string title, uint256 startingBid, uint256 endTime, bool isReverse)",
         "event BidPlaced(uint256 indexed auctionId, address indexed bidder, uint256 amount)",
-        "event AuctionEnded(uint256 indexed auctionId, address indexed winner, uint256 winningBid)"
+        "event AuctionEnded(uint256 indexed auctionId, address indexed winner, uint256 winningBid, uint256 platformFee, uint256 burnedAmount)",
+        "event TokensBurned(uint256 amount, uint256 indexed auctionId, string reason)"
       ];
 
       // Escrow Contract ABI (simplified)
       const escrowContractABI = [
-        "function createEscrow(uint256 auctionId, address buyer, address seller, uint256 amount) returns (uint256)",
+        "function createEscrow(uint256 auctionId, address buyer, address seller, uint256 amount, uint256 deliveryDays) returns (uint256)",
         "function fundEscrow(uint256 escrowId) payable",
         "function confirmDelivery(uint256 escrowId)",
-        "function releaseEscrow(uint256 escrowId)",
-        "function disputeEscrow(uint256 escrowId, string memory reason)",
-        "function resolveDispute(uint256 escrowId, bool releaseToBuyer)",
-        "function getEscrow(uint256 escrowId) view returns (tuple(address buyer, address seller, uint256 amount, uint8 status))",
-        "event EscrowCreated(uint256 indexed escrowId, address indexed buyer, address indexed seller, uint256 amount)",
+        "function raiseDispute(uint256 escrowId, string reason)",
+        "function resolveDispute(uint256 escrowId, address winner, uint256 buyerAmount, uint256 sellerAmount)",
+        "function getEscrowDetails(uint256 escrowId) view returns (address buyer, address seller, uint256 amount, uint8 status, uint256 deliveryDeadline, bool buyerConfirmed, bool sellerConfirmed)",
+        "event EscrowCreated(uint256 indexed escrowId, uint256 indexed auctionId, address indexed buyer, address seller, uint256 amount)",
         "event EscrowFunded(uint256 indexed escrowId)",
-        "event DeliveryConfirmed(uint256 indexed escrowId)",
-        "event EscrowReleased(uint256 indexed escrowId, address indexed recipient)",
-        "event DisputeCreated(uint256 indexed escrowId, string reason)"
+        "event DeliveryConfirmed(uint256 indexed escrowId, address confirmedBy)",
+        "event EscrowCompleted(uint256 indexed escrowId, uint256 amount)",
+        "event DisputeRaised(uint256 indexed escrowId, string reason, address raisedBy)",
+        "event DisputeResolved(uint256 indexed escrowId, address winner, uint256 amount)"
       ];
 
       // Initialize contract instances
@@ -103,6 +117,34 @@ class Web3Service {
       logger.info('Smart contracts initialized');
     } catch (error) {
       logger.error('Failed to initialize contracts:', error);
+      throw error;
+    }
+  }
+
+  // Enhanced token operations
+  async getTokenInfo() {
+    try {
+      const [name, symbol, decimals, totalSupply, totalBurned, circulatingSupply, burnRate] = await Promise.all([
+        this.contracts.wkcToken.name(),
+        this.contracts.wkcToken.symbol(),
+        this.contracts.wkcToken.decimals(),
+        this.contracts.wkcToken.totalSupply(),
+        this.contracts.wkcToken.totalBurned(),
+        this.contracts.wkcToken.getCirculatingSupply(),
+        this.contracts.wkcToken.getBurnRate()
+      ]);
+
+      return {
+        name,
+        symbol,
+        decimals: Number(decimals),
+        totalSupply: ethers.formatUnits(totalSupply, decimals),
+        totalBurned: ethers.formatUnits(totalBurned, decimals),
+        circulatingSupply: ethers.formatUnits(circulatingSupply, decimals),
+        burnRate: Number(burnRate) / 100 // Convert from basis points to percentage
+      };
+    } catch (error) {
+      logger.error('Error getting token info:', error);
       throw error;
     }
   }
@@ -163,18 +205,45 @@ class Web3Service {
     }
   }
 
+  async burnTokens(amount, reason) {
+    try {
+      const decimals = await this.contracts.wkcToken.decimals();
+      const amountInWei = ethers.parseUnits(amount.toString(), decimals);
+      
+      const tx = await this.contracts.wkcToken.burn(amountInWei, reason, {
+        gasLimit: process.env.GAS_LIMIT || 100000,
+        gasPrice: process.env.GAS_PRICE || ethers.parseUnits('20', 'gwei')
+      });
+      
+      const receipt = await tx.wait();
+      return {
+        transactionHash: receipt.hash,
+        blockNumber: receipt.blockNumber,
+        gasUsed: receipt.gasUsed.toString(),
+        burnedAmount: amount
+      };
+    } catch (error) {
+      logger.error('Error burning tokens:', error);
+      throw error;
+    }
+  }
+
   // Auction operations
-  async createAuctionOnChain(title, startingBid, duration, reservePrice = 0) {
+  async createAuctionOnChain(title, description, startingBid, reservePrice = 0, buyNowPrice = 0, duration, isReverse = false) {
     try {
       const decimals = await this.contracts.wkcToken.decimals();
       const startingBidInWei = ethers.parseUnits(startingBid.toString(), decimals);
       const reservePriceInWei = ethers.parseUnits(reservePrice.toString(), decimals);
+      const buyNowPriceInWei = buyNowPrice > 0 ? ethers.parseUnits(buyNowPrice.toString(), decimals) : 0;
       
       const tx = await this.contracts.auction.createAuction(
         title,
+        description,
         startingBidInWei,
-        duration,
         reservePriceInWei,
+        buyNowPriceInWei,
+        duration,
+        isReverse,
         {
           gasLimit: process.env.GAS_LIMIT || 200000,
           gasPrice: process.env.GAS_PRICE || ethers.parseUnits('20', 'gwei')
@@ -185,7 +254,7 @@ class Web3Service {
       
       // Extract auction ID from events
       const auctionCreatedEvent = receipt.logs.find(
-        log => log.topics[0] === ethers.id('AuctionCreated(uint256,address,uint256)')
+        log => log.topics[0] === ethers.id('AuctionCreated(uint256,address,string,uint256,uint256,bool)')
       );
       
       let auctionId = null;
@@ -228,6 +297,25 @@ class Web3Service {
     }
   }
 
+  async buyNowOnChain(auctionId) {
+    try {
+      const tx = await this.contracts.auction.buyNow(auctionId, {
+        gasLimit: process.env.GAS_LIMIT || 150000,
+        gasPrice: process.env.GAS_PRICE || ethers.parseUnits('20', 'gwei')
+      });
+      
+      const receipt = await tx.wait();
+      return {
+        transactionHash: receipt.hash,
+        blockNumber: receipt.blockNumber,
+        gasUsed: receipt.gasUsed.toString()
+      };
+    } catch (error) {
+      logger.error('Error buying now on chain:', error);
+      throw error;
+    }
+  }
+
   async endAuctionOnChain(auctionId) {
     try {
       const tx = await this.contracts.auction.endAuction(auctionId, {
@@ -248,7 +336,7 @@ class Web3Service {
   }
 
   // Escrow operations
-  async createEscrowOnChain(auctionId, buyerAddress, sellerAddress, amount) {
+  async createEscrowOnChain(auctionId, buyerAddress, sellerAddress, amount, deliveryDays = 7) {
     try {
       const decimals = await this.contracts.wkcToken.decimals();
       const amountInWei = ethers.parseUnits(amount.toString(), decimals);
@@ -258,6 +346,7 @@ class Web3Service {
         buyerAddress,
         sellerAddress,
         amountInWei,
+        deliveryDays,
         {
           gasLimit: process.env.GAS_LIMIT || 200000,
           gasPrice: process.env.GAS_PRICE || ethers.parseUnits('20', 'gwei')
@@ -268,7 +357,7 @@ class Web3Service {
       
       // Extract escrow ID from events
       const escrowCreatedEvent = receipt.logs.find(
-        log => log.topics[0] === ethers.id('EscrowCreated(uint256,address,address,uint256)')
+        log => log.topics[0] === ethers.id('EscrowCreated(uint256,uint256,address,address,uint256)')
       );
       
       let escrowId = null;
@@ -289,9 +378,9 @@ class Web3Service {
     }
   }
 
-  async releaseEscrowOnChain(escrowId) {
+  async fundEscrowOnChain(escrowId) {
     try {
-      const tx = await this.contracts.escrow.releaseEscrow(escrowId, {
+      const tx = await this.contracts.escrow.fundEscrow(escrowId, {
         gasLimit: process.env.GAS_LIMIT || 150000,
         gasPrice: process.env.GAS_PRICE || ethers.parseUnits('20', 'gwei')
       });
@@ -303,7 +392,45 @@ class Web3Service {
         gasUsed: receipt.gasUsed.toString()
       };
     } catch (error) {
-      logger.error('Error releasing escrow on chain:', error);
+      logger.error('Error funding escrow on chain:', error);
+      throw error;
+    }
+  }
+
+  async confirmDeliveryOnChain(escrowId) {
+    try {
+      const tx = await this.contracts.escrow.confirmDelivery(escrowId, {
+        gasLimit: process.env.GAS_LIMIT || 150000,
+        gasPrice: process.env.GAS_PRICE || ethers.parseUnits('20', 'gwei')
+      });
+      
+      const receipt = await tx.wait();
+      return {
+        transactionHash: receipt.hash,
+        blockNumber: receipt.blockNumber,
+        gasUsed: receipt.gasUsed.toString()
+      };
+    } catch (error) {
+      logger.error('Error confirming delivery on chain:', error);
+      throw error;
+    }
+  }
+
+  async raiseDisputeOnChain(escrowId, reason) {
+    try {
+      const tx = await this.contracts.escrow.raiseDispute(escrowId, reason, {
+        gasLimit: process.env.GAS_LIMIT || 150000,
+        gasPrice: process.env.GAS_PRICE || ethers.parseUnits('20', 'gwei')
+      });
+      
+      const receipt = await tx.wait();
+      return {
+        transactionHash: receipt.hash,
+        blockNumber: receipt.blockNumber,
+        gasUsed: receipt.gasUsed.toString()
+      };
+    } catch (error) {
+      logger.error('Error raising dispute on chain:', error);
       throw error;
     }
   }
@@ -339,34 +466,90 @@ class Web3Service {
   // Event listeners
   setupEventListeners() {
     try {
+      // Token events
+      if (this.contracts.wkcToken) {
+        this.contracts.wkcToken.on('TokensBurned', (amount, burner, reason, event) => {
+          logger.blockchain('tokens_burned', {
+            amount: ethers.formatUnits(amount, 18),
+            burner,
+            reason,
+            transactionHash: event.transactionHash
+          });
+          this.handleTokensBurned(amount, burner, reason, event);
+        });
+      }
+
       // Listen for auction events
       if (this.contracts.auction) {
-        this.contracts.auction.on('AuctionCreated', (auctionId, seller, startingBid, event) => {
-          logger.info(`Auction created: ${auctionId} by ${seller}`);
-          this.handleAuctionCreated(auctionId, seller, startingBid, event);
+        this.contracts.auction.on('AuctionCreated', (auctionId, seller, title, startingBid, endTime, isReverse, event) => {
+          logger.blockchain('auction_created', {
+            auctionId: auctionId.toString(),
+            seller,
+            title,
+            startingBid: ethers.formatUnits(startingBid, 18),
+            isReverse
+          });
+          this.handleAuctionCreated(auctionId, seller, title, startingBid, endTime, isReverse, event);
         });
 
-        this.contracts.auction.on('BidPlaced', (auctionId, bidder, amount, event) => {
-          logger.info(`Bid placed: ${amount} on auction ${auctionId} by ${bidder}`);
+        this.contracts.auction.on('BidPlaced', (auctionId, bidder, amount, timestamp, event) => {
+          logger.blockchain('bid_placed', {
+            auctionId: auctionId.toString(),
+            bidder,
+            amount: ethers.formatUnits(amount, 18)
+          });
           this.handleBidPlaced(auctionId, bidder, amount, event);
         });
 
-        this.contracts.auction.on('AuctionEnded', (auctionId, winner, winningBid, event) => {
-          logger.info(`Auction ended: ${auctionId} won by ${winner} with bid ${winningBid}`);
-          this.handleAuctionEnded(auctionId, winner, winningBid, event);
+        this.contracts.auction.on('AuctionEnded', (auctionId, winner, winningBid, platformFee, burnedAmount, event) => {
+          logger.blockchain('auction_ended', {
+            auctionId: auctionId.toString(),
+            winner,
+            winningBid: ethers.formatUnits(winningBid, 18),
+            platformFee: ethers.formatUnits(platformFee, 18),
+            burnedAmount: ethers.formatUnits(burnedAmount, 18)
+          });
+          this.handleAuctionEnded(auctionId, winner, winningBid, platformFee, burnedAmount, event);
+        });
+
+        this.contracts.auction.on('TokensBurned', (amount, auctionId, reason, event) => {
+          logger.blockchain('auction_tokens_burned', {
+            amount: ethers.formatUnits(amount, 18),
+            auctionId: auctionId.toString(),
+            reason
+          });
+          this.handleAuctionTokensBurned(amount, auctionId, reason, event);
         });
       }
 
       // Listen for escrow events
       if (this.contracts.escrow) {
-        this.contracts.escrow.on('EscrowCreated', (escrowId, buyer, seller, amount, event) => {
-          logger.info(`Escrow created: ${escrowId} for ${amount} tokens`);
-          this.handleEscrowCreated(escrowId, buyer, seller, amount, event);
+        this.contracts.escrow.on('EscrowCreated', (escrowId, auctionId, buyer, seller, amount, event) => {
+          logger.blockchain('escrow_created', {
+            escrowId: escrowId.toString(),
+            auctionId: auctionId.toString(),
+            buyer,
+            seller,
+            amount: ethers.formatUnits(amount, 18)
+          });
+          this.handleEscrowCreated(escrowId, auctionId, buyer, seller, amount, event);
         });
 
-        this.contracts.escrow.on('EscrowReleased', (escrowId, recipient, event) => {
-          logger.info(`Escrow released: ${escrowId} to ${recipient}`);
-          this.handleEscrowReleased(escrowId, recipient, event);
+        this.contracts.escrow.on('EscrowCompleted', (escrowId, amount, event) => {
+          logger.blockchain('escrow_completed', {
+            escrowId: escrowId.toString(),
+            amount: ethers.formatUnits(amount, 18)
+          });
+          this.handleEscrowCompleted(escrowId, amount, event);
+        });
+
+        this.contracts.escrow.on('DisputeRaised', (escrowId, reason, raisedBy, event) => {
+          logger.blockchain('dispute_raised', {
+            escrowId: escrowId.toString(),
+            reason,
+            raisedBy
+          });
+          this.handleDisputeRaised(escrowId, reason, raisedBy, event);
         });
       }
 
@@ -377,29 +560,249 @@ class Web3Service {
   }
 
   // Event handlers (to be implemented based on business logic)
-  async handleAuctionCreated(auctionId, seller, startingBid, event) {
-    // Implementation depends on your business logic
-    // Update database, send notifications, etc.
+  async handleTokensBurned(amount, burner, reason, event) {
+    try {
+      // Create burn transaction record
+      const burnTransaction = new TokenTransaction({
+        type: 'fee_burn',
+        user: {
+          userId: null, // System burn
+          walletAddress: burner,
+          anonymousId: 'SYSTEM_BURN'
+        },
+        amount: parseFloat(ethers.formatUnits(amount, 18)),
+        blockchain: {
+          transactionHash: event.transactionHash,
+          blockNumber: event.blockNumber,
+          isConfirmed: true
+        },
+        status: 'confirmed',
+        metadata: {
+          description: reason,
+          source: 'blockchain',
+          initiatedBy: 'system'
+        }
+      });
+
+      await burnTransaction.save();
+    } catch (error) {
+      logger.error('Error handling tokens burned event:', error);
+    }
+  }
+
+  async handleAuctionCreated(auctionId, seller, title, startingBid, endTime, isReverse, event) {
+    try {
+      // Update database auction with blockchain info
+      const Auction = require('../models/auctionModel');
+      await Auction.findOneAndUpdate(
+        { 'seller.walletAddress': seller.toLowerCase(), status: 'pending' },
+        {
+          $set: {
+            'blockchain.contractAddress': this.contracts.auction.address,
+            'blockchain.transactionHash': event.transactionHash,
+            'blockchain.blockNumber': event.blockNumber,
+            'blockchain.isOnChain': true,
+            status: 'active'
+          }
+        }
+      );
+    } catch (error) {
+      logger.error('Error handling auction created event:', error);
+    }
   }
 
   async handleBidPlaced(auctionId, bidder, amount, event) {
-    // Implementation depends on your business logic
-    // Update auction, notify other bidders, etc.
+    try {
+      // Update bid status in database
+      const Bid = require('../models/bidModel');
+      await Bid.findOneAndUpdate(
+        { 
+          'auction.auctionId': auctionId.toString(),
+          'bidder.walletAddress': bidder.toLowerCase(),
+          status: 'pending'
+        },
+        {
+          $set: {
+            'blockchain.transactionHash': event.transactionHash,
+            'blockchain.blockNumber': event.blockNumber,
+            'blockchain.isOnChain': true,
+            status: 'active',
+            'timing.confirmedAt': new Date()
+          }
+        }
+      );
+
+      // Broadcast via WebSocket
+      const { socketService } = require('./socketService');
+      if (socketService) {
+        socketService.broadcastBidUpdate(auctionId.toString(), {
+          bidder: bidder,
+          amount: ethers.formatUnits(amount, 18),
+          timestamp: new Date()
+        });
+      }
+    } catch (error) {
+      logger.error('Error handling bid placed event:', error);
+    }
   }
 
-  async handleAuctionEnded(auctionId, winner, winningBid, event) {
-    // Implementation depends on your business logic
-    // Create escrow, notify participants, etc.
+  async handleAuctionEnded(auctionId, winner, winningBid, platformFee, burnedAmount, event) {
+    try {
+      // Update auction in database
+      const Auction = require('../models/auctionModel');
+      const auction = await Auction.findOne({ auctionId: auctionId.toString() });
+      
+      if (auction) {
+        auction.status = 'ended';
+        if (winner !== ethers.ZeroAddress) {
+          auction.winner = {
+            walletAddress: winner,
+            winningBid: parseFloat(ethers.formatUnits(winningBid, 18)),
+            wonAt: new Date()
+          };
+        }
+        await auction.save();
+
+        // Create fee transaction records
+        if (platformFee > 0) {
+          const feeTransaction = new TokenTransaction({
+            type: 'fee_payment',
+            user: {
+              userId: null,
+              walletAddress: winner,
+              anonymousId: 'PLATFORM_FEE'
+            },
+            amount: parseFloat(ethers.formatUnits(platformFee, 18)),
+            blockchain: {
+              transactionHash: event.transactionHash,
+              blockNumber: event.blockNumber,
+              isConfirmed: true
+            },
+            fees: {
+              platformFee: parseFloat(ethers.formatUnits(platformFee, 18)),
+              burnAmount: parseFloat(ethers.formatUnits(burnedAmount, 18)),
+              treasuryAmount: parseFloat(ethers.formatUnits(platformFee, 18)) - parseFloat(ethers.formatUnits(burnedAmount, 18))
+            },
+            status: 'confirmed'
+          });
+          await feeTransaction.save();
+        }
+      }
+    } catch (error) {
+      logger.error('Error handling auction ended event:', error);
+    }
   }
 
-  async handleEscrowCreated(escrowId, buyer, seller, amount, event) {
-    // Implementation depends on your business logic
-    // Update database, notify parties, etc.
+  async handleAuctionTokensBurned(amount, auctionId, reason, event) {
+    try {
+      // This is already handled in the main TokensBurned event
+      // But we can add auction-specific logic here
+      logger.info(`Tokens burned for auction ${auctionId}: ${ethers.formatUnits(amount, 18)} WKC`);
+    } catch (error) {
+      logger.error('Error handling auction tokens burned event:', error);
+    }
   }
 
-  async handleEscrowReleased(escrowId, recipient, event) {
-    // Implementation depends on your business logic
-    // Update records, notify parties, etc.
+  async handleEscrowCreated(escrowId, auctionId, buyer, seller, amount, event) {
+    try {
+      // Create escrow record in database
+      const EscrowSchema = require('mongoose').Schema({
+        escrowId: String,
+        auctionId: String,
+        buyer: { walletAddress: String },
+        seller: { walletAddress: String },
+        amount: Number,
+        status: String,
+        blockchain: {
+          transactionHash: String,
+          blockNumber: Number,
+          isOnChain: Boolean
+        }
+      }, { timestamps: true });
+      
+      const Escrow = require('mongoose').model('Escrow', EscrowSchema);
+      
+      const escrow = new Escrow({
+        escrowId: escrowId.toString(),
+        auctionId: auctionId.toString(),
+        buyer: { walletAddress: buyer },
+        seller: { walletAddress: seller },
+        amount: parseFloat(ethers.formatUnits(amount, 18)),
+        status: 'created',
+        blockchain: {
+          transactionHash: event.transactionHash,
+          blockNumber: event.blockNumber,
+          isOnChain: true
+        }
+      });
+      
+      await escrow.save();
+    } catch (error) {
+      logger.error('Error handling escrow created event:', error);
+    }
+  }
+
+  async handleEscrowCompleted(escrowId, amount, event) {
+    try {
+      // Update escrow status in database
+      const Escrow = require('mongoose').model('Escrow');
+      await Escrow.findOneAndUpdate(
+        { escrowId: escrowId.toString() },
+        {
+          $set: {
+            status: 'completed',
+            'blockchain.transactionHash': event.transactionHash,
+            'blockchain.blockNumber': event.blockNumber
+          }
+        }
+      );
+    } catch (error) {
+      logger.error('Error handling escrow completed event:', error);
+    }
+  }
+
+  async handleDisputeRaised(escrowId, reason, raisedBy, event) {
+    try {
+      // Update escrow status and create dispute record
+      const Escrow = require('mongoose').model('Escrow');
+      await Escrow.findOneAndUpdate(
+        { escrowId: escrowId.toString() },
+        {
+          $set: {
+            status: 'disputed',
+            'dispute.isDisputed': true,
+            'dispute.reason': reason,
+            'dispute.filedAt': new Date()
+          }
+        }
+      );
+    } catch (error) {
+      logger.error('Error handling dispute raised event:', error);
+    }
+  }
+
+  // Platform statistics
+  async getPlatformStats() {
+    try {
+      const tokenInfo = await this.getTokenInfo();
+      const currentBlock = await this.getCurrentBlockNumber();
+      
+      return {
+        blockchain: {
+          currentBlock,
+          networkId: await this.provider.getNetwork().then(n => n.chainId)
+        },
+        token: tokenInfo,
+        contracts: {
+          wkcToken: process.env.WKC_CONTRACT_ADDRESS,
+          auction: process.env.AUCTION_CONTRACT_ADDRESS,
+          escrow: process.env.ESCROW_CONTRACT_ADDRESS
+        }
+      };
+    } catch (error) {
+      logger.error('Error getting platform stats:', error);
+      throw error;
+    }
   }
 }
 

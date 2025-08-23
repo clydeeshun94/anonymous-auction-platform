@@ -426,11 +426,50 @@ router.post('/', [
       method: shippingMethod,
       cost: shippingCost
     },
-    status: 'pending' // Requires approval
+    status: 'draft' // Will be pending after blockchain creation
   });
 
   await auction.save();
 
+  try {
+    // Create auction on blockchain
+    const blockchainResult = await web3Service.createAuctionOnChain(
+      title,
+      description,
+      startingBid,
+      reservePrice,
+      buyNowPrice,
+      parseInt(duration) / 1000, // Convert to seconds
+      type === 'reverse'
+    );
+
+    // Update auction with blockchain info
+    auction.blockchain.contractAddress = process.env.AUCTION_CONTRACT_ADDRESS;
+    auction.blockchain.transactionHash = blockchainResult.transactionHash;
+    auction.blockchain.blockNumber = blockchainResult.blockNumber;
+    auction.blockchain.isOnChain = true;
+    auction.status = 'pending'; // Now pending approval
+    await auction.save();
+
+    logger.auction('created_on_blockchain', auction.auctionId, {
+      userId: req.user.userId,
+      blockchainAuctionId: blockchainResult.auctionId,
+      transactionHash: blockchainResult.transactionHash
+    });
+
+  } catch (blockchainError) {
+    logger.error('Failed to create auction on blockchain:', blockchainError);
+    
+    // Mark auction as failed
+    auction.status = 'cancelled';
+    await auction.save();
+    
+    return res.status(400).json({
+      success: false,
+      message: 'Failed to create auction on blockchain',
+      data: null
+    });
+  }
   // Update user's auction count
   await User.findByIdAndUpdate(req.user.userId, {
     $inc: { 'profile.totalAuctions': 1 }
@@ -445,13 +484,14 @@ router.post('/', [
 
   res.status(201).json({
     success: true,
-    message: 'Auction created successfully and pending approval',
+    message: 'Auction created on blockchain and pending approval',
     data: {
       auction: {
         id: auction._id,
         auctionId: auction.auctionId,
         title: auction.title,
         status: auction.status,
+        blockchainTxHash: auction.blockchain.transactionHash,
         createdAt: auction.createdAt
       }
     }

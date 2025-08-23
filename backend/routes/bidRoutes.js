@@ -170,17 +170,16 @@ router.post('/:auctionId/bids', [
 
   try {
     // Lock tokens on blockchain
-    const lockResult = await web3Service.approveTokenSpending(
-      process.env.AUCTION_CONTRACT_ADDRESS,
+    const lockResult = await web3Service.placeBidOnChain(
+      auction.auctionId,
       amount
     );
 
     // Update bid with blockchain info
-    bid.blockchain.lockTransactionHash = lockResult.transactionHash;
-    bid.blockchain.lockBlockNumber = lockResult.blockNumber;
+    bid.blockchain.transactionHash = lockResult.transactionHash;
+    bid.blockchain.blockNumber = lockResult.blockNumber;
     bid.blockchain.isOnChain = true;
-    bid.status = 'active';
-    bid.timing.confirmedAt = new Date();
+    bid.status = 'pending'; // Will be updated to 'active' by blockchain event
     await bid.save();
 
     // Mark previous highest bidder as outbid
@@ -218,15 +217,14 @@ router.post('/:auctionId/bids', [
       blockchain: {
         transactionHash: lockResult.transactionHash,
         blockNumber: lockResult.blockNumber,
-        gasUsed: lockResult.gasUsed,
-        isConfirmed: true
+        gasUsed: lockResult.gasUsed
       },
       relatedTo: {
         type: 'bid',
         id: bid.bidId,
         reference: bid._id
       },
-      status: 'confirmed'
+      status: 'pending'
     });
 
     await tokenTransaction.save();
@@ -250,7 +248,7 @@ router.post('/:auctionId/bids', [
 
     res.status(201).json({
       success: true,
-      message: 'Bid placed successfully',
+      message: 'Bid submitted to blockchain - awaiting confirmation',
       data: {
         bid: {
           id: bid._id,
@@ -274,7 +272,7 @@ router.post('/:auctionId/bids', [
     
     res.status(400).json({
       success: false,
-      message: 'Failed to lock tokens on blockchain',
+      message: 'Failed to submit bid to blockchain',
       data: null
     });
   }
